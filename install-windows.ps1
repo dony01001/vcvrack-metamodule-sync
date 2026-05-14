@@ -12,7 +12,7 @@ if (-not (Test-Path $SyncScript)) {
 $taskName   = "VCVRack-MetaModule-Sync"
 $action     = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$SyncScript`""
+    -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$SyncScript`" -Favorites"
 $trigger    = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At "9:00AM"
 $settings   = New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable
 
