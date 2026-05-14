@@ -100,8 +100,9 @@ MM_SLUGS = [
 
 # Paid plugins -- require purchase on library.vcvrack.com before download
 MM_PAID = {
-    "UnfilteredVolume1",  # $25 -- https://library.vcvrack.com/UnfilteredVolume1
-    "UnfilteredVolume2",  # $30 -- https://library.vcvrack.com/UnfilteredVolume2
+    "StellareModular-CreativeSuite",  # $25 -- https://library.vcvrack.com/StellareModular-CreativeSuite
+    "UnfilteredVolume1",              # $25 -- https://library.vcvrack.com/UnfilteredVolume1
+    "UnfilteredVolume2",              # $30 -- https://library.vcvrack.com/UnfilteredVolume2
 }
 
 MODULEFINDER_URL = "https://metamodule.4ms.info/modulefinder"

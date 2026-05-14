@@ -43,8 +43,9 @@ $MM_SLUGS = @(
 
 # Paid plugins -- require purchase on library.vcvrack.com before download
 $MM_PAID = @{
-    "UnfilteredVolume1" = '$25'
-    "UnfilteredVolume2" = '$30'
+    "StellareModular-CreativeSuite" = '$25'
+    "UnfilteredVolume1"             = '$25'
+    "UnfilteredVolume2"             = '$30'
 }
 
 $ActiveSlugs = if ($IncludePaid) { $MM_SLUGS } else { $MM_SLUGS | Where-Object { -not $MM_PAID.ContainsKey($_) } }

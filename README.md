@@ -64,6 +64,7 @@ Two MetaModule-compatible plugins are **paid** and are skipped by default:
 
 | Plugin | Price | Link |
 |--------|-------|------|
+| StellareModular-CreativeSuite | $25 | https://library.vcvrack.com/StellareModular-CreativeSuite |
 | UnfilteredVolume1 | $25 | https://library.vcvrack.com/UnfilteredVolume1 |
 | UnfilteredVolume2 | $30 | https://library.vcvrack.com/UnfilteredVolume2 |
 
