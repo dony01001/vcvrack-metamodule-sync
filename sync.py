@@ -130,9 +130,8 @@ def get_rack_paths(arch: str):
     else:
         base = Path.home() / ".local" / "share" / "Rack2"
     return {
-        "settings":  base / "settings.json",
-        "plugins":   base / f"plugins-{arch}",
-        "favorites": base / "favoriteModules.json",
+        "settings": base / "settings.json",
+        "plugins":  base / f"plugins-{arch}",
     }
 
 
@@ -228,50 +227,57 @@ def get_installed_version(plugin_dir: Path, slug: str) -> str:
 
 # -- Favorites -----------------------------------------------------------------
 
-def update_favorites(plugin_dir: Path, favorites_path: Path):
+def update_favorites(settings_path: Path):
     """
-    Merge MetaModule-compatible modules into favoriteModules.json.
-    Uses metamodule.4ms.info/modulefinder for the exact list of compatible
-    modules (not all modules in a plugin, only those confirmed by 4ms).
-    Falls back to plugin.json if modulefinder is unreachable.
+    Mark MetaModule-compatible modules as favorites in settings.json
+    (moduleInfos[plugin][module].favorite = true).
+
+    VCV Rack must be CLOSED before running this — Rack overwrites
+    settings.json on exit and will discard any changes made while open.
+
+    Uses metamodule.4ms.info/modulefinder for the exact list.
+    Falls back to reading installed plugin.json if modulefinder unreachable.
     """
-    # Backup existing file
-    fav = {}
-    if favorites_path.exists():
-        ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = favorites_path.with_name(f"favoriteModules.backup.{ts}.json")
-        shutil.copy2(favorites_path, backup)
-        print(f"  Backup saved: {backup.name}")
-        try:
-            with open(favorites_path) as f:
-                fav = json.load(f)
-        except Exception:
-            fav = {}
+    if not settings_path.exists():
+        print(f"  ERROR: settings.json not found at {settings_path}")
+        print("  Open VCV Rack once, log in, close it, then re-run.")
+        return
+
+    # Backup
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = settings_path.with_name(f"settings.backup.{ts}.json")
+    shutil.copy2(settings_path, backup)
+    print(f"  Backup saved: {backup.name}")
+
+    # Load settings
+    with open(settings_path, encoding="utf-8") as f:
+        settings = json.load(f)
+
+    module_infos = settings.setdefault("moduleInfos", {})
 
     # Fetch exact MM module list from modulefinder
     print("  Fetching module list from metamodule.4ms.info/modulefinder...")
     mm_modules = fetch_modulefinder()
 
     if mm_modules:
-        print(f"  Found {sum(len(v) for v in mm_modules.values())} MM-compatible modules across {len(mm_modules)} plugins")
+        total_mm = sum(len(v) for v in mm_modules.values())
+        print(f"  Found {total_mm} MM-compatible modules across {len(mm_modules)} plugins")
         source = "modulefinder"
     else:
-        print("  Falling back to local plugin.json (modulefinder unreachable)")
+        print("  WARNING: modulefinder unreachable -- falling back to local plugin.json")
         source = "local"
 
-    added_mods = 0
-    skipped    = 0
+    plugin_dir = settings_path.parent / f"plugins-{get_platform_info()}"
+    added = 0; skipped = 0
 
     for slug in MM_SLUGS:
         if mm_modules:
-            # Use exact list from modulefinder
             module_slugs = mm_modules.get(slug, [])
             if not module_slugs:
                 print(f"  SKIP {slug:<44} not in modulefinder")
                 skipped += 1
                 continue
         else:
-            # Fallback: all modules from installed plugin.json
             pjson = plugin_dir / slug / "plugin.json"
             if not pjson.exists():
                 print(f"  SKIP {slug:<44} not installed")
@@ -286,18 +292,21 @@ def update_favorites(plugin_dir: Path, favorites_path: Path):
                 skipped += 1
                 continue
 
-        # Replace MM plugin entry with exact modulefinder data (not merge)
-        # so stale modules from old plugin.json runs don't accumulate
-        old_count  = len(fav.get(slug, []))
-        fav[slug]  = module_slugs
-        added_mods += len(module_slugs)
-        print(f"  FAV  {slug:<44} {len(module_slugs)} modules (was {old_count})  [{source}]")
+        plugin_info = module_infos.setdefault(slug, {})
+        new_count = 0
+        for mod in module_slugs:
+            if not plugin_info.get(mod, {}).get("favorite"):
+                plugin_info.setdefault(mod, {})["favorite"] = True
+                new_count += 1
+        added += new_count
+        print(f"  FAV  {slug:<44} {len(module_slugs)} modules (+{new_count} new)  [{source}]")
 
-    with open(favorites_path, "w") as f:
-        json.dump(fav, f, indent=2)
+    # Write back
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
 
-    print(f"\n+{added_mods} modules added to favorites. {skipped} plugins skipped.")
-    print("Restart VCV Rack and filter by Favorites to see MetaModule-compatible modules.")
+    print(f"\n+{added} modules marked as favorite. {skipped} plugins skipped.")
+    print("Open VCV Rack and filter by Favorites to see MetaModule-compatible modules.")
 
 
 # -- Main ----------------------------------------------------------------------
@@ -436,8 +445,9 @@ examples:
 
     # -- Favorites -------------------------------------------------------------
     if args.favorites:
-        print("\nUpdating VCV Rack favorites with MetaModule modules...")
-        update_favorites(plugin_dir, paths["favorites"])
+        print("\nMarking MetaModule modules as favorites in settings.json...")
+        print("  NOTE: VCV Rack must be CLOSED or changes will be lost.")
+        update_favorites(paths["settings"])
 
 
 if __name__ == "__main__":

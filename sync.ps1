@@ -22,7 +22,6 @@ $MODULEFINDER_URL = "https://metamodule.4ms.info/modulefinder"
 $RackRoot         = if (Test-Path "$env:LOCALAPPDATA\Rack2\settings.json") { "$env:LOCALAPPDATA\Rack2" } else { "$env:APPDATA\Rack2" }
 $PluginDir        = "$RackRoot\plugins-$Arch"
 $SettingsFile     = "$RackRoot\settings.json"
-$FavoritesFile    = "$RackRoot\favoriteModules.json"
 
 # MetaModule compatible slugs - source: https://metamodule.4ms.info/modulefinder
 $MM_SLUGS = @(
@@ -189,19 +188,26 @@ if ($downloaded -gt 0) {
 # -- Favorites ----------------------------------------------------------------
 if ($Favorites) {
     Write-Host ""
-    Write-Host "Updating VCV Rack favorites with MetaModule modules..."
+    Write-Host "Marking MetaModule modules as favorites in settings.json..."
+    Write-Host "  NOTE: VCV Rack must be CLOSED or changes will be lost."
 
-    # Backup
-    $fav = @{}
-    if (Test-Path $FavoritesFile) {
-        $ts     = Get-Date -Format "yyyyMMdd_HHmmss"
-        $backup = [IO.Path]::Combine([IO.Path]::GetDirectoryName($FavoritesFile), "favoriteModules.backup.$ts.json")
-        Copy-Item $FavoritesFile $backup
-        Write-Host "  Backup saved: $(Split-Path $backup -Leaf)"
-        try {
-            $raw = Get-Content $FavoritesFile -Raw | ConvertFrom-Json
-            $raw.PSObject.Properties | ForEach-Object { $fav[$_.Name] = [System.Collections.Generic.List[string]]@($_.Value) }
-        } catch { $fav = @{} }
+    if (-not (Test-Path $SettingsFile)) {
+        Write-Error "settings.json not found. Open VCV Rack once, log in, close it, then re-run."
+        exit 1
+    }
+
+    # Backup settings.json
+    $ts     = Get-Date -Format "yyyyMMdd_HHmmss"
+    $backup = "$RackRoot\settings.backup.$ts.json"
+    Copy-Item $SettingsFile $backup
+    Write-Host "  Backup saved: settings.backup.$ts.json"
+
+    # Load settings
+    $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
+
+    # Ensure moduleInfos exists
+    if (-not $settings.PSObject.Properties["moduleInfos"]) {
+        $settings | Add-Member -NotePropertyName "moduleInfos" -NotePropertyValue ([PSCustomObject]@{})
     }
 
     # Fetch exact MM module list from modulefinder
@@ -209,17 +215,15 @@ if ($Favorites) {
     $mmModules = @{}
     try {
         $html = (Invoke-WebRequest -Uri $MODULEFINDER_URL -UseBasicParsing -TimeoutSec 30).Content
-        $matches = [regex]::Matches($html, 'https://library\.vcvrack\.com/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)')
-        foreach ($m in $matches) {
-            $p = $m.Groups[1].Value
-            $mod = $m.Groups[2].Value
-            if (-not $mmModules.ContainsKey($p)) { $mmModules[$p] = [System.Collections.Generic.List[string]]::new() }
+        [regex]::Matches($html, 'https://library\.vcvrack\.com/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)') | ForEach-Object {
+            $p = $_.Groups[1].Value; $mod = $_.Groups[2].Value
+            if (-not $mmModules[$p]) { $mmModules[$p] = [System.Collections.Generic.List[string]]::new() }
             if (-not $mmModules[$p].Contains($mod)) { $mmModules[$p].Add($mod) }
         }
         $totalMods = ($mmModules.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
         Write-Host "  Found $totalMods MM-compatible modules across $($mmModules.Count) plugins"
     } catch {
-        Write-Host "  WARNING: could not fetch modulefinder ($_) -- falling back to local plugin.json"
+        Write-Host "  WARNING: modulefinder unreachable -- falling back to local plugin.json"
     }
 
     $addedMods  = 0
@@ -227,44 +231,48 @@ if ($Favorites) {
 
     foreach ($slug in $MM_SLUGS) {
         if ($mmModules.Count -gt 0) {
-            # Use exact list from modulefinder
             if (-not $mmModules.ContainsKey($slug)) {
                 Write-Host ("  SKIP {0,-44} not in modulefinder" -f $slug)
-                $skippedFav++
-                continue
+                $skippedFav++; continue
             }
             $moduleSlugs = @($mmModules[$slug])
         } else {
-            # Fallback: all modules from installed plugin.json
             $pjson = "$PluginDir\$slug\plugin.json"
             if (-not (Test-Path $pjson)) {
                 Write-Host ("  SKIP {0,-44} not installed" -f $slug)
-                $skippedFav++
-                continue
+                $skippedFav++; continue
             }
-            try {
-                $moduleSlugs = @((Get-Content $pjson -Raw | ConvertFrom-Json).modules | ForEach-Object { $_.slug })
-            } catch {
-                Write-Host ("  SKIP {0,-44} could not read plugin.json" -f $slug)
-                $skippedFav++
-                continue
-            }
+            try { $moduleSlugs = @((Get-Content $pjson -Raw | ConvertFrom-Json).modules | ForEach-Object { $_.slug }) }
+            catch { Write-Host ("  SKIP {0,-44} could not read plugin.json" -f $slug); $skippedFav++; continue }
         }
-
         if ($moduleSlugs.Count -eq 0) { $skippedFav++; continue }
 
-        # Replace MM plugin entry with exact modulefinder data (not merge)
-        # so stale modules from old plugin.json runs don't accumulate
-        $oldCount   = if ($fav.ContainsKey($slug)) { @($fav[$slug]).Count } else { 0 }
-        $fav[$slug] = @($moduleSlugs)
-        $addedMods += $moduleSlugs.Count
+        # Ensure plugin entry exists in moduleInfos
+        if (-not $settings.moduleInfos.PSObject.Properties[$slug]) {
+            $settings.moduleInfos | Add-Member -NotePropertyName $slug -NotePropertyValue ([PSCustomObject]@{})
+        }
+        $pluginInfo = $settings.moduleInfos.$slug
+        $newCount = 0
+
+        foreach ($mod in $moduleSlugs) {
+            if (-not $pluginInfo.PSObject.Properties[$mod]) {
+                $pluginInfo | Add-Member -NotePropertyName $mod -NotePropertyValue ([PSCustomObject]@{ favorite = $true })
+                $newCount++
+            } elseif ($pluginInfo.$mod.favorite -ne $true) {
+                $pluginInfo.$mod | Add-Member -NotePropertyName "favorite" -NotePropertyValue $true -Force
+                $newCount++
+            }
+        }
+        $addedMods += $newCount
         $source = if ($mmModules.Count -gt 0) { "modulefinder" } else { "local" }
-        Write-Host ("  FAV  {0,-44} {1} modules (was {2})  [{3}]" -f $slug, $moduleSlugs.Count, $oldCount, $source)
+        Write-Host ("  FAV  {0,-44} {1} modules (+{2} new)  [{3}]" -f $slug, $moduleSlugs.Count, $newCount, $source)
     }
 
-    $fav | ConvertTo-Json -Depth 5 | Set-Content $FavoritesFile -Encoding UTF8
+    # Write back as UTF-8 without BOM (Rack expects this)
+    $json = $settings | ConvertTo-Json -Depth 20
+    [System.IO.File]::WriteAllText($SettingsFile, $json, [System.Text.UTF8Encoding]::new($false))
 
     Write-Host ""
-    Write-Host "+$addedMods modules added to favorites. $skippedFav plugins skipped."
-    Write-Host "Restart VCV Rack and filter by Favorites to see MetaModule-compatible modules."
+    Write-Host "+$addedMods modules marked as favorite. $skippedFav plugins skipped."
+    Write-Host "Open VCV Rack and filter by Favorites to see MetaModule-compatible modules."
 }
