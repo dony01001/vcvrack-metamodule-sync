@@ -196,8 +196,16 @@ def get_installed_version(plugin_dir: Path, slug: str) -> str:
 
 def update_favorites(plugin_dir: Path, favorites_path: Path):
     """Merge all installed MM-compatible modules into favoriteModules.json."""
+    import shutil
+    from datetime import datetime
+
     fav = {}
     if favorites_path.exists():
+        # Backup before modifying
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = favorites_path.with_name(f"favoriteModules.backup.{ts}.json")
+        shutil.copy2(favorites_path, backup)
+        print(f"  Backup saved: {backup.name}")
         try:
             with open(favorites_path) as f:
                 fav = json.load(f)

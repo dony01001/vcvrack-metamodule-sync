@@ -198,6 +198,11 @@ if ($Favorites) {
 
     $fav = @{}
     if (Test-Path $FavoritesFile) {
+        # Backup before modifying
+        $ts     = Get-Date -Format "yyyyMMdd_HHmmss"
+        $backup = [System.IO.Path]::ChangeExtension($FavoritesFile, $null).TrimEnd('.') + ".backup.$ts.json"
+        Copy-Item $FavoritesFile $backup
+        Write-Host "  Backup saved: $(Split-Path $backup -Leaf)"
         try {
             $raw = Get-Content $FavoritesFile -Raw | ConvertFrom-Json
             $raw.PSObject.Properties | ForEach-Object { $fav[$_.Name] = [System.Collections.Generic.List[string]]$_.Value }
