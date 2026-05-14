@@ -252,12 +252,13 @@ if ($Favorites) {
 
         if ($moduleSlugs.Count -eq 0) { $skippedFav++; continue }
 
-        $existing = if ($fav.ContainsKey($slug)) { @($fav[$slug]) } else { @() }
-        $newMods  = $moduleSlugs | Where-Object { $existing -notcontains $_ }
-        $fav[$slug] = @($existing) + @($newMods)
-        $addedMods += $newMods.Count
+        # Replace MM plugin entry with exact modulefinder data (not merge)
+        # so stale modules from old plugin.json runs don't accumulate
+        $oldCount   = if ($fav.ContainsKey($slug)) { @($fav[$slug]).Count } else { 0 }
+        $fav[$slug] = @($moduleSlugs)
+        $addedMods += $moduleSlugs.Count
         $source = if ($mmModules.Count -gt 0) { "modulefinder" } else { "local" }
-        Write-Host ("  FAV  {0,-44} {1} modules (+{2} new)  [{3}]" -f $slug, $moduleSlugs.Count, $newMods.Count, $source)
+        Write-Host ("  FAV  {0,-44} {1} modules (was {2})  [{3}]" -f $slug, $moduleSlugs.Count, $oldCount, $source)
     }
 
     $fav | ConvertTo-Json -Depth 5 | Set-Content $FavoritesFile -Encoding UTF8

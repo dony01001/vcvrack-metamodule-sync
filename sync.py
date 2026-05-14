@@ -285,11 +285,12 @@ def update_favorites(plugin_dir: Path, favorites_path: Path):
                 skipped += 1
                 continue
 
-        existing  = fav.get(slug, [])
-        new_mods  = [m for m in module_slugs if m not in existing]
-        fav[slug] = existing + new_mods
-        added_mods += len(new_mods)
-        print(f"  FAV  {slug:<44} {len(module_slugs)} modules (+{len(new_mods)} new)  [{source}]")
+        # Replace MM plugin entry with exact modulefinder data (not merge)
+        # so stale modules from old plugin.json runs don't accumulate
+        old_count  = len(fav.get(slug, []))
+        fav[slug]  = module_slugs
+        added_mods += len(module_slugs)
+        print(f"  FAV  {slug:<44} {len(module_slugs)} modules (was {old_count})  [{source}]")
 
     with open(favorites_path, "w") as f:
         json.dump(fav, f, indent=2)
