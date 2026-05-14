@@ -19,9 +19,11 @@ import platform
 import re
 import shutil
 import sys
+import tempfile
 import urllib.request
 import urllib.error
 import webbrowser
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -98,6 +100,8 @@ MM_SLUGS = [
     "voxglitch",
 ]
 
+MM_SLUGS_SET = set(MM_SLUGS)
+
 # Paid plugins -- require purchase on library.vcvrack.com before download
 MM_PAID = {
     "StellareModular-CreativeSuite",  # $25 -- https://library.vcvrack.com/StellareModular-CreativeSuite
@@ -106,7 +110,9 @@ MM_PAID = {
 }
 
 MODULEFINDER_URL = "https://metamodule.4ms.info/modulefinder"
-API = "https://api.vcvrack.com"
+API              = "https://api.vcvrack.com"
+USER_AGENT       = "vcvrack-metamodule-sync/2.0"
+BACKUP_KEEP      = 5   # number of settings backups to retain
 
 
 # -- Platform helpers ----------------------------------------------------------
@@ -139,19 +145,48 @@ def read_token(settings_path: Path) -> str:
     if not settings_path.exists():
         return ""
     try:
-        with open(settings_path) as f:
+        with open(settings_path, encoding="utf-8") as f:
             return json.load(f).get("token", "")
     except Exception:
         return ""
 
 
+def is_rack_running() -> bool:
+    """Return True if VCV Rack is currently running."""
+    try:
+        if platform.system() == "Windows":
+            import subprocess
+            out = subprocess.check_output(
+                ["tasklist", "/FI", "IMAGENAME eq Rack.exe", "/NH"],
+                stderr=subprocess.DEVNULL
+            ).decode()
+            return "Rack.exe" in out
+        else:
+            import subprocess
+            out = subprocess.check_output(["pgrep", "-x", "Rack"], stderr=subprocess.DEVNULL)
+            return bool(out.strip())
+    except Exception:
+        return False
+
+
+def is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
 # -- Network helpers -----------------------------------------------------------
 
-def api_get(path: str, token: str = "") -> dict:
-    url = f"{API}{path}"
+def _make_req(url: str, token: str = "") -> urllib.request.Request:
     req = urllib.request.Request(url)
+    req.add_header("User-Agent", USER_AGENT)
     if token:
         req.add_header("Cookie", f"token={token}")
+    return req
+
+
+def api_get(path: str, token: str = "") -> dict:
+    """GET from VCV API. Token only sent when explicitly provided."""
+    url = f"{API}{path}"
+    req = _make_req(url, token)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read())
@@ -163,25 +198,26 @@ def api_get(path: str, token: str = "") -> dict:
 
 def fetch_modulefinder() -> dict[str, list[str]]:
     """
-    Scrape metamodule.4ms.info/modulefinder and return
-    {plugin_slug: [module_slug, ...]} for every MM-compatible module.
+    Scrape metamodule.4ms.info/modulefinder for the exact set of
+    MM-compatible modules. Returns {plugin_slug: [module_slug, ...]}.
+    Slugs are validated against MM_SLUGS_SET — unknown plugin slugs
+    extracted from the page are discarded.
     Falls back to empty dict on failure.
     """
     try:
-        req = urllib.request.Request(
-            MODULEFINDER_URL,
-            headers={"User-Agent": "vcvrack-metamodule-sync/2.0"}
-        )
+        req = _make_req(MODULEFINDER_URL)
         with urllib.request.urlopen(req, timeout=30) as r:
             html = r.read().decode("utf-8", errors="replace")
     except Exception as e:
         print(f"  WARNING: could not fetch modulefinder ({e})")
         return {}
 
-    # Extract links like https://library.vcvrack.com/PluginSlug/ModuleSlug
     pattern = r'https://library\.vcvrack\.com/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)'
     result: dict[str, list[str]] = {}
     for plugin_slug, module_slug in re.findall(pattern, html):
+        # H4: only accept plugin slugs that are in our known allowlist
+        if plugin_slug not in MM_SLUGS_SET:
+            continue
         result.setdefault(plugin_slug, [])
         if module_slug not in result[plugin_slug]:
             result[plugin_slug].append(module_slug)
@@ -190,27 +226,46 @@ def fetch_modulefinder() -> dict[str, list[str]]:
 
 
 def download_plugin(slug: str, version: str, arch: str, token: str, dest: Path):
-    """Returns (ok: bool, needs_subscribe: bool)"""
+    """
+    Download a .vcvplugin and validate it is a zip archive.
+    Returns (ok: bool, needs_subscribe: bool).
+    Writes to a temp file first, renames on success (C2/M3).
+    Token is sent only to the /download endpoint (L3).
+    """
     url = f"{API}/download?slug={slug}&version={version}&arch={arch}"
-    req = urllib.request.Request(url)
-    if token:
-        req.add_header("Cookie", f"token={token}")
+    req = _make_req(url, token)   # token sent here only
+
+    tmp = dest.with_suffix(".tmp")
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             data = r.read()
-        if len(data) < 1000:
+
+        # C1: validate zip magic bytes before writing
+        if len(data) < 22 or data[:2] != b'PK':
             return False, False
-        dest.write_bytes(data)
+
+        tmp.write_bytes(data)
+
+        # C1: verify the zip is actually parseable
+        if not zipfile.is_zipfile(tmp):
+            tmp.unlink(missing_ok=True)
+            return False, False
+
+        # Atomic rename (C2/M3)
+        os.replace(tmp, dest)
         return True, False
+
     except urllib.error.HTTPError as e:
+        tmp.unlink(missing_ok=True)
         try:
-            body = e.read().decode()
+            body = e.read().decode(errors="replace")
         except Exception:
             body = ""
         if "not owned" in body or "not subscribed" in body or "downloadable" in body:
             return False, True
         return False, False
     except Exception:
+        tmp.unlink(missing_ok=True)
         return False, False
 
 
@@ -219,10 +274,45 @@ def get_installed_version(plugin_dir: Path, slug: str) -> str:
     if not pjson.exists():
         return ""
     try:
-        with open(pjson) as f:
+        with open(pjson, encoding="utf-8") as f:
             return json.load(f).get("version", "")
     except Exception:
         return ""
+
+
+# -- Backup helpers ------------------------------------------------------------
+
+def backup_and_rotate(target: Path, prefix: str, keep: int = BACKUP_KEEP) -> Path:
+    """
+    Copy target to a timestamped backup, then delete oldest backups
+    beyond the retention count. Returns the backup path.
+    """
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = target.with_name(f"{prefix}.backup.{ts}.json")
+    shutil.copy2(target, backup)
+
+    # Rotate: keep only the N most recent
+    pattern = f"{prefix}.backup.*.json"
+    old_backups = sorted(target.parent.glob(pattern))
+    for old in old_backups[:-keep]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+    return backup
+
+
+def atomic_json_write(path: Path, data: dict) -> None:
+    """Write JSON atomically via temp file + rename (C2)."""
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # -- Favorites -----------------------------------------------------------------
@@ -232,21 +322,21 @@ def update_favorites(settings_path: Path):
     Mark MetaModule-compatible modules as favorites in settings.json
     (moduleInfos[plugin][module].favorite = true).
 
-    VCV Rack must be CLOSED before running this — Rack overwrites
-    settings.json on exit and will discard any changes made while open.
-
-    Uses metamodule.4ms.info/modulefinder for the exact list.
-    Falls back to reading installed plugin.json if modulefinder unreachable.
+    VCV Rack must be CLOSED -- Rack overwrites settings.json on exit.
     """
     if not settings_path.exists():
         print(f"  ERROR: settings.json not found at {settings_path}")
         print("  Open VCV Rack once, log in, close it, then re-run.")
         return
 
-    # Backup
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = settings_path.with_name(f"settings.backup.{ts}.json")
-    shutil.copy2(settings_path, backup)
+    # H3/L5: abort if Rack is running
+    if is_rack_running():
+        print("  ERROR: VCV Rack is currently running.")
+        print("  Close Rack first, then re-run with --favorites.")
+        return
+
+    # Backup with rotation (H2)
+    backup = backup_and_rotate(settings_path, "settings")
     print(f"  Backup saved: {backup.name}")
 
     # Load settings
@@ -284,7 +374,7 @@ def update_favorites(settings_path: Path):
                 skipped += 1
                 continue
             try:
-                with open(pjson) as f:
+                with open(pjson, encoding="utf-8") as f:
                     meta = json.load(f)
                 module_slugs = [m["slug"] for m in meta.get("modules", [])]
             except Exception:
@@ -301,9 +391,8 @@ def update_favorites(settings_path: Path):
         added += new_count
         print(f"  FAV  {slug:<44} {len(module_slugs)} modules (+{new_count} new)  [{source}]")
 
-    # Write back
-    with open(settings_path, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
+    # C2: atomic write
+    atomic_json_write(settings_path, settings)
 
     print(f"\n+{added} modules marked as favorite. {skipped} plugins skipped.")
     print("Open VCV Rack and filter by Favorites to see MetaModule-compatible modules.")
@@ -312,6 +401,9 @@ def update_favorites(settings_path: Path):
 # -- Main ----------------------------------------------------------------------
 
 def confirm(prompt: str) -> bool:
+    # M4: skip prompt in non-interactive mode
+    if not is_interactive():
+        return False
     try:
         return input(f"{prompt} [y/N] ").strip().lower() == "y"
     except (EOFError, KeyboardInterrupt):
@@ -327,17 +419,19 @@ examples:
   python3 sync.py                  sync all free MetaModule plugins
   python3 sync.py --check          dry run: show what would change
   python3 sync.py --subscribe      open browser to subscribe missing plugins
-  python3 sync.py --favorites      add MM modules to VCV Rack favorites
+  python3 sync.py --favorites      add MM modules to VCV Rack favorites (Rack must be closed)
   python3 sync.py --include-paid   also include paid plugins
         """,
     )
     parser.add_argument("--check",        action="store_true", help="Dry run -- show what would change")
     parser.add_argument("--list",         action="store_true", help="Print MetaModule plugin list and exit")
     parser.add_argument("--subscribe",    action="store_true", help="Open browser tabs for plugins needing subscribe")
-    parser.add_argument("--favorites",    action="store_true", help="Add MM modules to VCV Rack favorites")
+    parser.add_argument("--favorites",    action="store_true", help="Add MM modules to VCV Rack favorites (Rack must be closed)")
     parser.add_argument("--include-paid", action="store_true", help="Include paid plugins (skipped by default)")
-    parser.add_argument("--token",        default="", help="Override VCV token")
-    parser.add_argument("--arch",         default="", help="Override platform arch (e.g. lin-x64)")
+    # H1: token via env var preferred; CLI arg kept for compatibility but discouraged
+    parser.add_argument("--token", default="", metavar="TOKEN",
+                        help="Override VCV token (prefer VCV_TOKEN env var to avoid process-list exposure)")
+    parser.add_argument("--arch",  default="", help="Override platform arch (e.g. lin-x64)")
     args = parser.parse_args()
 
     active_slugs = MM_SLUGS if args.include_paid else [s for s in MM_SLUGS if s not in MM_PAID]
@@ -350,7 +444,9 @@ examples:
 
     arch  = args.arch or get_platform_info()
     paths = get_rack_paths(arch)
-    token = args.token or read_token(paths["settings"])
+
+    # H1: prefer env var over CLI arg to keep token out of process list
+    token = args.token or os.environ.get("VCV_TOKEN", "") or read_token(paths["settings"])
 
     if not token:
         print("ERROR: No VCV token found.")
@@ -369,9 +465,10 @@ examples:
     print(f"Syncing  : {len(active_slugs)} plugins{paid_note}")
     print()
 
+    # L3: manifests are public -- no token needed
     print("Fetching plugin versions from VCV Library...")
     try:
-        manifests_data = api_get("/library/manifests?version=2", token)
+        manifests_data = api_get("/library/manifests?version=2")
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
@@ -415,7 +512,6 @@ examples:
         elif needs_sub:
             print("  NEEDS SUBSCRIBE")
             to_subscribe.append(slug)
-            out.unlink(missing_ok=True)
         else:
             print("  FAILED")
             out.unlink(missing_ok=True)
@@ -446,7 +542,6 @@ examples:
     # -- Favorites -------------------------------------------------------------
     if args.favorites:
         print("\nMarking MetaModule modules as favorites in settings.json...")
-        print("  NOTE: VCV Rack must be CLOSED or changes will be lost.")
         update_favorites(paths["settings"])
 
 

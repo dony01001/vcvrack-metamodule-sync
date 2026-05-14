@@ -1,11 +1,23 @@
-# install-windows.ps1 — one-time setup on Windows
+# install-windows.ps1 - one-time setup on Windows
 # Registers a weekly Task Scheduler job to run sync.ps1
+#
+# Must run as Administrator (Task Scheduler registration requires elevation).
+# Right-click PowerShell -> "Run as administrator", then:
+#   Set-Location "<path to repo>"
+#   .\install-windows.ps1
 
-$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$SyncScript = "$ScriptDir\sync.ps1"
+# H5: require Administrator
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error "This script must run as Administrator. Right-click PowerShell and choose 'Run as administrator'."
+    exit 1
+}
+
+# L1: $PSScriptRoot is reliable; $MyInvocation.MyCommand.Path can fail in some hosts
+$SyncScript = Join-Path $PSScriptRoot "sync.ps1"
 
 if (-not (Test-Path $SyncScript)) {
-    Write-Error "sync.ps1 not found in $ScriptDir"
+    Write-Error "sync.ps1 not found in $PSScriptRoot"
     exit 1
 }
 
