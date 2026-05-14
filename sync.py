@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-sync.py — VCV Rack ↔ 4ms MetaModule plugin sync
+sync.py -- VCV Rack <-> 4ms MetaModule plugin sync
 Works on Linux, macOS, and Windows.
 
 Usage:
-    python3 sync.py            # sync all MetaModule-compatible plugins
-    python3 sync.py --check    # show what would change, don't download
-    python3 sync.py --list     # print full MetaModule plugin list
+    python3 sync.py                # sync all free MetaModule-compatible plugins
+    python3 sync.py --check        # dry run: show what would change
+    python3 sync.py --list         # print full plugin list
+    python3 sync.py --subscribe    # open browser tabs for unsubscribed plugins
+    python3 sync.py --favorites    # add MM modules to VCV Rack favorites
+    python3 sync.py --include-paid # also include paid plugins ($)
 """
 
 import argparse
@@ -16,9 +19,10 @@ import platform
 import sys
 import urllib.request
 import urllib.error
+import webbrowser
 from pathlib import Path
 
-# ── MetaModule compatible plugin slugs ────────────────────────────────────────
+# -- MetaModule compatible plugin slugs ---------------------------------------
 # Source: https://metamodule.4ms.info/plugins
 MM_SLUGS = [
     "21kHz",
@@ -87,40 +91,46 @@ MM_SLUGS = [
     "voxglitch",
 ]
 
+# Paid plugins -- require purchase on library.vcvrack.com before download
+MM_PAID = {
+    "UnfilteredVolume1",  # $25 -- https://library.vcvrack.com/UnfilteredVolume1
+    "UnfilteredVolume2",  # $30 -- https://library.vcvrack.com/UnfilteredVolume2
+}
+
 API = "https://api.vcvrack.com"
 
 
 def get_platform_info():
     sys_name = platform.system()
     machine = platform.machine().lower()
-
     if sys_name == "Windows":
         os_key = "win"
     elif sys_name == "Darwin":
         os_key = "mac"
     else:
         os_key = "lin"
-
     if "arm" in machine or "aarch64" in machine:
         cpu_key = "arm64"
     else:
         cpu_key = "x64"
-
     return f"{os_key}-{cpu_key}"
 
 
 def get_rack_paths(arch: str):
     sys_name = platform.system()
     if sys_name == "Windows":
-        base = Path(os.environ.get("APPDATA", "")) / "Rack2"
+        # VCV Rack on Windows stores data in %LOCALAPPDATA%\Rack2
+        local   = Path(os.environ.get("LOCALAPPDATA", ""))
+        roaming = Path(os.environ.get("APPDATA", ""))
+        base = local / "Rack2" if (local / "Rack2" / "settings.json").exists() else roaming / "Rack2"
     elif sys_name == "Darwin":
         base = Path.home() / "Documents" / "Rack2"
     else:
         base = Path.home() / ".local" / "share" / "Rack2"
-
     return {
-        "settings": base / "settings.json",
-        "plugins": base / f"plugins-{arch}",
+        "settings":  base / "settings.json",
+        "plugins":   base / f"plugins-{arch}",
+        "favorites": base / "favoriteModules.json",
     }
 
 
@@ -148,7 +158,8 @@ def api_get(path: str, token: str = "") -> dict:
         raise RuntimeError(f"Request failed: {e}")
 
 
-def download_plugin(slug: str, version: str, arch: str, token: str, dest: Path) -> bool:
+def download_plugin(slug: str, version: str, arch: str, token: str, dest: Path):
+    """Returns (ok: bool, needs_subscribe: bool)"""
     url = f"{API}/download?slug={slug}&version={version}&arch={arch}"
     req = urllib.request.Request(url)
     if token:
@@ -157,11 +168,19 @@ def download_plugin(slug: str, version: str, arch: str, token: str, dest: Path) 
         with urllib.request.urlopen(req, timeout=120) as r:
             data = r.read()
         if len(data) < 1000:
-            return False
+            return False, False
         dest.write_bytes(data)
-        return True
+        return True, False
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode()
+        except Exception:
+            body = ""
+        if "not owned" in body or "not subscribed" in body or "downloadable" in body:
+            return False, True
+        return False, False
     except Exception:
-        return False
+        return False, False
 
 
 def get_installed_version(plugin_dir: Path, slug: str) -> str:
@@ -175,37 +194,108 @@ def get_installed_version(plugin_dir: Path, slug: str) -> str:
         return ""
 
 
+def update_favorites(plugin_dir: Path, favorites_path: Path):
+    """Merge all installed MM-compatible modules into favoriteModules.json."""
+    fav = {}
+    if favorites_path.exists():
+        try:
+            with open(favorites_path) as f:
+                fav = json.load(f)
+        except Exception:
+            fav = {}
+
+    added_mods   = 0
+    skipped      = 0
+
+    for slug in MM_SLUGS:
+        pjson = plugin_dir / slug / "plugin.json"
+        if not pjson.exists():
+            print(f"  SKIP {slug:<40} not installed")
+            skipped += 1
+            continue
+        try:
+            with open(pjson) as f:
+                meta = json.load(f)
+            module_slugs = [m["slug"] for m in meta.get("modules", [])]
+        except Exception:
+            print(f"  SKIP {slug:<40} could not read plugin.json")
+            skipped += 1
+            continue
+
+        if not module_slugs:
+            skipped += 1
+            continue
+
+        existing  = fav.get(slug, [])
+        new_mods  = [m for m in module_slugs if m not in existing]
+        fav[slug] = existing + new_mods
+        added_mods += len(new_mods)
+        print(f"  FAV  {slug:<40} {len(module_slugs)} modules (+{len(new_mods)} new)")
+
+    with open(favorites_path, "w") as f:
+        json.dump(fav, f, indent=2)
+
+    print(f"\n+{added_mods} modules added to favorites. {skipped} plugins skipped (not installed).")
+    print("Restart VCV Rack and filter by Favorites to see MetaModule-compatible modules.")
+
+
+def confirm(prompt: str) -> bool:
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() == "y"
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Sync VCV Rack with MetaModule plugins")
-    parser.add_argument("--check", action="store_true", help="Dry run — show what would change")
-    parser.add_argument("--list", action="store_true", help="Print MetaModule plugin list and exit")
-    parser.add_argument("--token", default="", help="Override VCV token")
-    parser.add_argument("--arch", default="", help="Override platform arch (e.g. lin-x64)")
+    parser = argparse.ArgumentParser(
+        description="Sync VCV Rack plugins with those compatible with the 4ms MetaModule.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python3 sync.py                  sync all free MetaModule plugins
+  python3 sync.py --check          dry run: show what would change
+  python3 sync.py --subscribe      open browser to subscribe missing plugins
+  python3 sync.py --favorites      add MM modules to VCV Rack favorites
+  python3 sync.py --include-paid   also include paid plugins
+        """,
+    )
+    parser.add_argument("--check",        action="store_true", help="Dry run -- show what would change")
+    parser.add_argument("--list",         action="store_true", help="Print MetaModule plugin list and exit")
+    parser.add_argument("--subscribe",    action="store_true", help="Open browser tabs for plugins needing subscribe")
+    parser.add_argument("--favorites",    action="store_true", help="Add MM modules to VCV Rack favorites")
+    parser.add_argument("--include-paid", action="store_true", help="Include paid plugins (skipped by default)")
+    parser.add_argument("--token",        default="", help="Override VCV token")
+    parser.add_argument("--arch",         default="", help="Override platform arch (e.g. lin-x64)")
     args = parser.parse_args()
 
+    active_slugs = MM_SLUGS if args.include_paid else [s for s in MM_SLUGS if s not in MM_PAID]
+
     if args.list:
-        print("\n".join(sorted(MM_SLUGS)))
+        for s in sorted(active_slugs):
+            paid = " [$]" if s in MM_PAID else ""
+            print(f"{s}{paid}")
         return
 
-    arch = args.arch or get_platform_info()
+    arch  = args.arch or get_platform_info()
     paths = get_rack_paths(arch)
     token = args.token or read_token(paths["settings"])
 
     if not token:
         print("ERROR: No VCV token found.")
-        print(f"  Open VCV Rack, log in via Library menu, then re-run this script.")
-        print(f"  Expected settings file: {paths['settings']}")
+        print("  Open VCV Rack and log in via Library menu, then re-run.")
+        print(f"  Expected: {paths['settings']}")
         sys.exit(1)
 
     plugin_dir = paths["plugins"]
     plugin_dir.mkdir(parents=True, exist_ok=True)
 
+    paid_note = " (including paid)" if args.include_paid else f" (+ {len(MM_PAID)} paid skipped, use --include-paid)"
     print(f"Platform : {arch}")
     print(f"Plugins  : {plugin_dir}")
     print(f"Mode     : {'DRY RUN' if args.check else 'SYNC'}")
+    print(f"Syncing  : {len(active_slugs)} plugins{paid_note}")
     print()
 
-    # Fetch manifests
     print("Fetching plugin versions from VCV Library...")
     try:
         manifests_data = api_get("/library/manifests?version=2", token)
@@ -213,31 +303,30 @@ def main():
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    manifests = manifests_data.get("manifests", {})
+    manifests    = manifests_data.get("manifests", {})
+    downloaded   = 0
+    skipped      = 0
+    failed       = 0
+    to_subscribe = []
 
-    downloaded = skipped = failed = 0
-
-    for slug in MM_SLUGS:
+    for slug in active_slugs:
         manifest = manifests.get(slug, {})
-        version = manifest.get("version", "")
-        arches = manifest.get("arches", {})
+        version  = manifest.get("version", "")
+        arches   = manifest.get("arches", {})
 
         if not version or not arches.get(arch):
-            print(f"  SKIP {slug:40s} — not available for {arch}")
+            print(f"  SKIP {slug:<40} not available for {arch}")
             skipped += 1
             continue
 
         installed = get_installed_version(plugin_dir, slug)
-
         if installed == version:
-            print(f"  OK   {slug:40s} {version}")
+            print(f"  OK   {slug:<40} {version}")
             skipped += 1
             continue
 
-        if installed:
-            label = f"UPD  {slug:40s} {installed} → {version}"
-        else:
-            label = f"GET  {slug:40s} {version}"
+        label = (f"UPD  {slug:<40} {installed} -> {version}"
+                 if installed else f"GET  {slug:<40} {version}")
 
         if args.check:
             print(f"  {label}  [dry run]")
@@ -245,19 +334,46 @@ def main():
 
         print(f"  {label}", end="", flush=True)
         out = plugin_dir / f"{slug}-{version}-{arch}.vcvplugin"
-        ok = download_plugin(slug, version, arch, token, out)
+        ok, needs_sub = download_plugin(slug, version, arch, token, out)
+
         if ok:
-            print("  ✓")
+            print("  OK")
             downloaded += 1
+        elif needs_sub:
+            print("  NEEDS SUBSCRIBE")
+            to_subscribe.append(slug)
+            out.unlink(missing_ok=True)
         else:
-            print("  ✗ FAILED")
+            print("  FAILED")
             out.unlink(missing_ok=True)
             failed += 1
 
     print()
-    print(f"Downloaded: {downloaded}  Skipped: {skipped}  Failed: {failed}")
-    if downloaded:
-        print("Restart VCV Rack to load new plugins.")
+    print(f"Downloaded: {downloaded}  Skipped: {skipped}  Failed: {failed}  Need subscribe: {len(to_subscribe)}")
+
+    # -- Subscribe list -------------------------------------------------------
+    if to_subscribe:
+        print()
+        print("Subscribe these plugins for free at library.vcvrack.com:")
+        for slug in to_subscribe:
+            print(f"  https://library.vcvrack.com/{slug}")
+
+        if args.subscribe:
+            print()
+            if confirm(f"Open {len(to_subscribe)} browser tabs?"):
+                for slug in to_subscribe:
+                    webbrowser.open(f"https://library.vcvrack.com/{slug}")
+                print("Click Subscribe on each tab, then re-run sync.")
+        else:
+            print("\nTip: run with --subscribe to open all URLs in browser automatically.")
+
+    if downloaded > 0:
+        print("\nRestart VCV Rack to load new plugins.")
+
+    # -- Favorites ------------------------------------------------------------
+    if args.favorites:
+        print("\nUpdating VCV Rack favorites with MetaModule modules...")
+        update_favorites(plugin_dir, paths["favorites"])
 
 
 if __name__ == "__main__":
