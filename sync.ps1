@@ -17,25 +17,26 @@ param(
     [string]$Arch  = "win-x64"
 )
 
-$API           = "https://api.vcvrack.com"
-$RackRoot      = if (Test-Path "$env:LOCALAPPDATA\Rack2\settings.json") { "$env:LOCALAPPDATA\Rack2" } else { "$env:APPDATA\Rack2" }
-$PluginDir     = "$RackRoot\plugins-$Arch"
-$SettingsFile  = "$RackRoot\settings.json"
-$FavoritesFile = "$RackRoot\favoriteModules.json"
+$API              = "https://api.vcvrack.com"
+$MODULEFINDER_URL = "https://metamodule.4ms.info/modulefinder"
+$RackRoot         = if (Test-Path "$env:LOCALAPPDATA\Rack2\settings.json") { "$env:LOCALAPPDATA\Rack2" } else { "$env:APPDATA\Rack2" }
+$PluginDir        = "$RackRoot\plugins-$Arch"
+$SettingsFile     = "$RackRoot\settings.json"
+$FavoritesFile    = "$RackRoot\favoriteModules.json"
 
-# MetaModule compatible slugs - source: https://metamodule.4ms.info/plugins
+# MetaModule compatible slugs - source: https://metamodule.4ms.info/modulefinder
 $MM_SLUGS = @(
     "21kHz","4ms-ProducerPack","4ms-ROMplers","4ms-XOXDrums","4msCompany",
-    "Airwin2Rack","AlliewayAudio_Freebies","AmalgamatedHarmonics","Autinn",
-    "Bastl","Befaco","Bidoo","BlackNoiseModular","Bogaudio","CVfunk","Cella",
+    "Airwin2Rack","AlliewayAudio_Freebies","AmalgamatedHarmonics","AudibleInstruments",
+    "Autinn","Bastl","Befaco","Bidoo","BlackNoiseModular","Bogaudio","CVfunk","Cella",
     "ChowDSP","CosineKitty-Sapphire","CountModula","CuteLab","DrumKit",
     "ESeries","FehlerFabrik-Suite","Fundamental","Geodesics","HetrickCV",
-    "ImpromptuModular","JW-Modules","KRTPluginA","MADZINE","MSM","MUS-X",
+    "ImpromptuModular","InfrasonicAudio","JW-Modules","KRTPluginA","MADZINE","MSM","MUS-X",
     "MockbaModular","Moffenzeef","NANOModules","NOI","NonlinearCircuits",
-    "Nozoid","OrangeLine","PathSet","RPJ","RebelTech","Rigatoni",
+    "Nozoid","Ondas","OrangeLine","PathSet","RPJ","RebelTech","Rigatoni",
     "SanguineMonsters","SanguineMutants","SeasideModular","SickoCV",
-    "SignalFunctionSet","SonusModular","StellareModular","StudioSixPlusOne",
-    "UnfilteredVolume1","UnfilteredVolume2","Valley","Venom","WordGenerator",
+    "SignalFunctionSet","SonusModular","StellareModular","StellareModular-CreativeSuite",
+    "StudioSixPlusOne","UnfilteredVolume1","UnfilteredVolume2","Valley","Venom","WordGenerator",
     "dBiz","eightfold","kocmoc","mscHack","nullpath","squinkylabs-plug1",
     "vanTies","voxglitch"
 )
@@ -56,13 +57,12 @@ if ($List) {
     exit 0
 }
 
-# Read token
+# -- Token --------------------------------------------------------------------
 if (-not $Token) {
     if (Test-Path $SettingsFile) {
         $Token = (Get-Content $SettingsFile -Raw | ConvertFrom-Json).token
     }
 }
-
 if (-not $Token) {
     Write-Error "No VCV token found. Open VCV Rack, log in via Library menu, then re-run."
     exit 1
@@ -78,6 +78,7 @@ Write-Host "Mode     : $mode"
 Write-Host "Syncing  : $($ActiveSlugs.Count) plugins$paidNote"
 Write-Host ""
 
+# -- Fetch manifests ----------------------------------------------------------
 Write-Host "Fetching plugin versions from VCV Library..."
 $headers = @{ Cookie = "token=$Token" }
 try {
@@ -95,16 +96,15 @@ $toSubscribe = [System.Collections.Generic.List[string]]::new()
 foreach ($slug in $ActiveSlugs) {
     $manifest = $manifests.$slug
     if (-not $manifest) {
-        Write-Host ("  SKIP {0,-40} not in VCV Library" -f $slug)
+        Write-Host ("  SKIP {0,-44} not in VCV Library" -f $slug)
         $skipped++
         continue
     }
 
     $version = $manifest.version
     $archOk  = $manifest.arches.$Arch
-
     if (-not $version -or -not $archOk) {
-        Write-Host ("  SKIP {0,-40} not available for $Arch" -f $slug)
+        Write-Host ("  SKIP {0,-44} not available for $Arch" -f $slug)
         $skipped++
         continue
     }
@@ -116,21 +116,18 @@ foreach ($slug in $ActiveSlugs) {
     }
 
     if ($installedVer -eq $version) {
-        Write-Host ("  OK   {0,-40} {1}" -f $slug, $version)
+        Write-Host ("  OK   {0,-44} {1}" -f $slug, $version)
         $skipped++
         continue
     }
 
     $label = if ($installedVer) {
-        "UPD  {0,-40} $installedVer -> $version" -f $slug
+        "UPD  {0,-44} $installedVer -> $version" -f $slug
     } else {
-        "GET  {0,-40} $version" -f $slug
+        "GET  {0,-44} $version" -f $slug
     }
 
-    if ($Check) {
-        Write-Host "  $label  [dry run]"
-        continue
-    }
+    if ($Check) { Write-Host "  $label  [dry run]"; continue }
 
     Write-Host -NoNewline "  $label"
 
@@ -148,8 +145,7 @@ foreach ($slug in $ActiveSlugs) {
         }
     } catch {
         if (Test-Path $outFile) { Remove-Item $outFile -Force }
-        $errBody = $_.ErrorDetails.Message
-        if ($errBody -match "not owned|not subscribed|downloadable") {
+        if ($_.ErrorDetails.Message -match "not owned|not subscribed|downloadable") {
             Write-Host "  NEEDS SUBSCRIBE"
             $toSubscribe.Add($slug)
         } else {
@@ -166,9 +162,7 @@ Write-Host "Downloaded: $downloaded  Skipped: $skipped  Failed: $failed  Need su
 if ($toSubscribe.Count -gt 0) {
     Write-Host ""
     Write-Host "Subscribe these plugins for free at library.vcvrack.com:"
-    foreach ($slug in $toSubscribe) {
-        Write-Host "  https://library.vcvrack.com/$slug"
-    }
+    foreach ($slug in $toSubscribe) { Write-Host "  https://library.vcvrack.com/$slug" }
 
     if ($Subscribe) {
         Write-Host ""
@@ -196,36 +190,64 @@ if ($Favorites) {
     Write-Host ""
     Write-Host "Updating VCV Rack favorites with MetaModule modules..."
 
+    # Backup
     $fav = @{}
     if (Test-Path $FavoritesFile) {
-        # Backup before modifying
         $ts     = Get-Date -Format "yyyyMMdd_HHmmss"
-        $backup = [System.IO.Path]::ChangeExtension($FavoritesFile, $null).TrimEnd('.') + ".backup.$ts.json"
+        $backup = [IO.Path]::Combine([IO.Path]::GetDirectoryName($FavoritesFile), "favoriteModules.backup.$ts.json")
         Copy-Item $FavoritesFile $backup
         Write-Host "  Backup saved: $(Split-Path $backup -Leaf)"
         try {
             $raw = Get-Content $FavoritesFile -Raw | ConvertFrom-Json
-            $raw.PSObject.Properties | ForEach-Object { $fav[$_.Name] = [System.Collections.Generic.List[string]]$_.Value }
+            $raw.PSObject.Properties | ForEach-Object { $fav[$_.Name] = [System.Collections.Generic.List[string]]@($_.Value) }
         } catch { $fav = @{} }
     }
 
-    $addedMods = 0
+    # Fetch exact MM module list from modulefinder
+    Write-Host "  Fetching module list from metamodule.4ms.info/modulefinder..."
+    $mmModules = @{}
+    try {
+        $html = (Invoke-WebRequest -Uri $MODULEFINDER_URL -UseBasicParsing -TimeoutSec 30).Content
+        $matches = [regex]::Matches($html, 'https://library\.vcvrack\.com/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)')
+        foreach ($m in $matches) {
+            $p = $m.Groups[1].Value
+            $mod = $m.Groups[2].Value
+            if (-not $mmModules.ContainsKey($p)) { $mmModules[$p] = [System.Collections.Generic.List[string]]::new() }
+            if (-not $mmModules[$p].Contains($mod)) { $mmModules[$p].Add($mod) }
+        }
+        $totalMods = ($mmModules.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+        Write-Host "  Found $totalMods MM-compatible modules across $($mmModules.Count) plugins"
+    } catch {
+        Write-Host "  WARNING: could not fetch modulefinder ($_) -- falling back to local plugin.json"
+    }
+
+    $addedMods  = 0
     $skippedFav = 0
 
-    foreach ($slug in $MM_SLUGS) {   # always use full list for favorites
-        $pjson = "$PluginDir\$slug\plugin.json"
-        if (-not (Test-Path $pjson)) {
-            Write-Host ("  SKIP {0,-40} not installed" -f $slug)
-            $skippedFav++
-            continue
-        }
-        try {
-            $pluginMeta  = Get-Content $pjson -Raw | ConvertFrom-Json
-            $moduleSlugs = @($pluginMeta.modules | ForEach-Object { $_.slug })
-        } catch {
-            Write-Host ("  SKIP {0,-40} could not read plugin.json" -f $slug)
-            $skippedFav++
-            continue
+    foreach ($slug in $MM_SLUGS) {
+        if ($mmModules.Count -gt 0) {
+            # Use exact list from modulefinder
+            if (-not $mmModules.ContainsKey($slug)) {
+                Write-Host ("  SKIP {0,-44} not in modulefinder" -f $slug)
+                $skippedFav++
+                continue
+            }
+            $moduleSlugs = @($mmModules[$slug])
+        } else {
+            # Fallback: all modules from installed plugin.json
+            $pjson = "$PluginDir\$slug\plugin.json"
+            if (-not (Test-Path $pjson)) {
+                Write-Host ("  SKIP {0,-44} not installed" -f $slug)
+                $skippedFav++
+                continue
+            }
+            try {
+                $moduleSlugs = @((Get-Content $pjson -Raw | ConvertFrom-Json).modules | ForEach-Object { $_.slug })
+            } catch {
+                Write-Host ("  SKIP {0,-44} could not read plugin.json" -f $slug)
+                $skippedFav++
+                continue
+            }
         }
 
         if ($moduleSlugs.Count -eq 0) { $skippedFav++; continue }
@@ -234,13 +256,13 @@ if ($Favorites) {
         $newMods  = $moduleSlugs | Where-Object { $existing -notcontains $_ }
         $fav[$slug] = @($existing) + @($newMods)
         $addedMods += $newMods.Count
-
-        Write-Host ("  FAV  {0,-40} {1} modules (+{2} new)" -f $slug, $moduleSlugs.Count, $newMods.Count)
+        $source = if ($mmModules.Count -gt 0) { "modulefinder" } else { "local" }
+        Write-Host ("  FAV  {0,-44} {1} modules (+{2} new)  [{3}]" -f $slug, $moduleSlugs.Count, $newMods.Count, $source)
     }
 
     $fav | ConvertTo-Json -Depth 5 | Set-Content $FavoritesFile -Encoding UTF8
 
     Write-Host ""
-    Write-Host "+$addedMods modules added to favorites. $skippedFav plugins skipped (not installed)."
+    Write-Host "+$addedMods modules added to favorites. $skippedFav plugins skipped."
     Write-Host "Restart VCV Rack and filter by Favorites to see MetaModule-compatible modules."
 }

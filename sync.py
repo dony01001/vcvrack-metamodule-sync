@@ -16,14 +16,17 @@ import argparse
 import json
 import os
 import platform
+import re
+import shutil
 import sys
 import urllib.request
 import urllib.error
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
-# -- MetaModule compatible plugin slugs ---------------------------------------
-# Source: https://metamodule.4ms.info/plugins
+# -- MetaModule compatible plugin slugs ----------------------------------------
+# Source: https://metamodule.4ms.info/modulefinder
 MM_SLUGS = [
     "21kHz",
     "4ms-ProducerPack",
@@ -33,6 +36,7 @@ MM_SLUGS = [
     "Airwin2Rack",
     "AlliewayAudio_Freebies",
     "AmalgamatedHarmonics",
+    "AudibleInstruments",
     "Autinn",
     "Bastl",
     "Befaco",
@@ -52,6 +56,7 @@ MM_SLUGS = [
     "Geodesics",
     "HetrickCV",
     "ImpromptuModular",
+    "InfrasonicAudio",
     "JW-Modules",
     "KRTPluginA",
     "MADZINE",
@@ -63,6 +68,7 @@ MM_SLUGS = [
     "NOI",
     "NonlinearCircuits",
     "Nozoid",
+    "Ondas",
     "OrangeLine",
     "PathSet",
     "RPJ",
@@ -75,6 +81,7 @@ MM_SLUGS = [
     "SignalFunctionSet",
     "SonusModular",
     "StellareModular",
+    "StellareModular-CreativeSuite",
     "StudioSixPlusOne",
     "UnfilteredVolume1",
     "UnfilteredVolume2",
@@ -97,29 +104,23 @@ MM_PAID = {
     "UnfilteredVolume2",  # $30 -- https://library.vcvrack.com/UnfilteredVolume2
 }
 
+MODULEFINDER_URL = "https://metamodule.4ms.info/modulefinder"
 API = "https://api.vcvrack.com"
 
 
+# -- Platform helpers ----------------------------------------------------------
+
 def get_platform_info():
     sys_name = platform.system()
-    machine = platform.machine().lower()
-    if sys_name == "Windows":
-        os_key = "win"
-    elif sys_name == "Darwin":
-        os_key = "mac"
-    else:
-        os_key = "lin"
-    if "arm" in machine or "aarch64" in machine:
-        cpu_key = "arm64"
-    else:
-        cpu_key = "x64"
+    machine  = platform.machine().lower()
+    os_key   = {"Windows": "win", "Darwin": "mac"}.get(sys_name, "lin")
+    cpu_key  = "arm64" if ("arm" in machine or "aarch64" in machine) else "x64"
     return f"{os_key}-{cpu_key}"
 
 
 def get_rack_paths(arch: str):
     sys_name = platform.system()
     if sys_name == "Windows":
-        # VCV Rack on Windows stores data in %LOCALAPPDATA%\Rack2
         local   = Path(os.environ.get("LOCALAPPDATA", ""))
         roaming = Path(os.environ.get("APPDATA", ""))
         base = local / "Rack2" if (local / "Rack2" / "settings.json").exists() else roaming / "Rack2"
@@ -144,6 +145,8 @@ def read_token(settings_path: Path) -> str:
         return ""
 
 
+# -- Network helpers -----------------------------------------------------------
+
 def api_get(path: str, token: str = "") -> dict:
     url = f"{API}{path}"
     req = urllib.request.Request(url)
@@ -156,6 +159,34 @@ def api_get(path: str, token: str = "") -> dict:
         raise RuntimeError(f"HTTP {e.code} fetching {url}")
     except Exception as e:
         raise RuntimeError(f"Request failed: {e}")
+
+
+def fetch_modulefinder() -> dict[str, list[str]]:
+    """
+    Scrape metamodule.4ms.info/modulefinder and return
+    {plugin_slug: [module_slug, ...]} for every MM-compatible module.
+    Falls back to empty dict on failure.
+    """
+    try:
+        req = urllib.request.Request(
+            MODULEFINDER_URL,
+            headers={"User-Agent": "vcvrack-metamodule-sync/2.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"  WARNING: could not fetch modulefinder ({e})")
+        return {}
+
+    # Extract links like https://library.vcvrack.com/PluginSlug/ModuleSlug
+    pattern = r'https://library\.vcvrack\.com/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)'
+    result: dict[str, list[str]] = {}
+    for plugin_slug, module_slug in re.findall(pattern, html):
+        result.setdefault(plugin_slug, [])
+        if module_slug not in result[plugin_slug]:
+            result[plugin_slug].append(module_slug)
+
+    return result
 
 
 def download_plugin(slug: str, version: str, arch: str, token: str, dest: Path):
@@ -194,15 +225,19 @@ def get_installed_version(plugin_dir: Path, slug: str) -> str:
         return ""
 
 
-def update_favorites(plugin_dir: Path, favorites_path: Path):
-    """Merge all installed MM-compatible modules into favoriteModules.json."""
-    import shutil
-    from datetime import datetime
+# -- Favorites -----------------------------------------------------------------
 
+def update_favorites(plugin_dir: Path, favorites_path: Path):
+    """
+    Merge MetaModule-compatible modules into favoriteModules.json.
+    Uses metamodule.4ms.info/modulefinder for the exact list of compatible
+    modules (not all modules in a plugin, only those confirmed by 4ms).
+    Falls back to plugin.json if modulefinder is unreachable.
+    """
+    # Backup existing file
     fav = {}
     if favorites_path.exists():
-        # Backup before modifying
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = favorites_path.with_name(f"favoriteModules.backup.{ts}.json")
         shutil.copy2(favorites_path, backup)
         print(f"  Backup saved: {backup.name}")
@@ -212,40 +247,58 @@ def update_favorites(plugin_dir: Path, favorites_path: Path):
         except Exception:
             fav = {}
 
-    added_mods   = 0
-    skipped      = 0
+    # Fetch exact MM module list from modulefinder
+    print("  Fetching module list from metamodule.4ms.info/modulefinder...")
+    mm_modules = fetch_modulefinder()
+
+    if mm_modules:
+        print(f"  Found {sum(len(v) for v in mm_modules.values())} MM-compatible modules across {len(mm_modules)} plugins")
+        source = "modulefinder"
+    else:
+        print("  Falling back to local plugin.json (modulefinder unreachable)")
+        source = "local"
+
+    added_mods = 0
+    skipped    = 0
 
     for slug in MM_SLUGS:
-        pjson = plugin_dir / slug / "plugin.json"
-        if not pjson.exists():
-            print(f"  SKIP {slug:<40} not installed")
-            skipped += 1
-            continue
-        try:
-            with open(pjson) as f:
-                meta = json.load(f)
-            module_slugs = [m["slug"] for m in meta.get("modules", [])]
-        except Exception:
-            print(f"  SKIP {slug:<40} could not read plugin.json")
-            skipped += 1
-            continue
-
-        if not module_slugs:
-            skipped += 1
-            continue
+        if mm_modules:
+            # Use exact list from modulefinder
+            module_slugs = mm_modules.get(slug, [])
+            if not module_slugs:
+                print(f"  SKIP {slug:<44} not in modulefinder")
+                skipped += 1
+                continue
+        else:
+            # Fallback: all modules from installed plugin.json
+            pjson = plugin_dir / slug / "plugin.json"
+            if not pjson.exists():
+                print(f"  SKIP {slug:<44} not installed")
+                skipped += 1
+                continue
+            try:
+                with open(pjson) as f:
+                    meta = json.load(f)
+                module_slugs = [m["slug"] for m in meta.get("modules", [])]
+            except Exception:
+                print(f"  SKIP {slug:<44} could not read plugin.json")
+                skipped += 1
+                continue
 
         existing  = fav.get(slug, [])
         new_mods  = [m for m in module_slugs if m not in existing]
         fav[slug] = existing + new_mods
         added_mods += len(new_mods)
-        print(f"  FAV  {slug:<40} {len(module_slugs)} modules (+{len(new_mods)} new)")
+        print(f"  FAV  {slug:<44} {len(module_slugs)} modules (+{len(new_mods)} new)  [{source}]")
 
     with open(favorites_path, "w") as f:
         json.dump(fav, f, indent=2)
 
-    print(f"\n+{added_mods} modules added to favorites. {skipped} plugins skipped (not installed).")
+    print(f"\n+{added_mods} modules added to favorites. {skipped} plugins skipped.")
     print("Restart VCV Rack and filter by Favorites to see MetaModule-compatible modules.")
 
+
+# -- Main ----------------------------------------------------------------------
 
 def confirm(prompt: str) -> bool:
     try:
@@ -297,7 +350,8 @@ examples:
     plugin_dir = paths["plugins"]
     plugin_dir.mkdir(parents=True, exist_ok=True)
 
-    paid_note = " (including paid)" if args.include_paid else f" (+ {len(MM_PAID)} paid skipped, use --include-paid)"
+    paid_note = (" (including paid)" if args.include_paid
+                 else f" (+ {len(MM_PAID)} paid skipped, use --include-paid)")
     print(f"Platform : {arch}")
     print(f"Plugins  : {plugin_dir}")
     print(f"Mode     : {'DRY RUN' if args.check else 'SYNC'}")
@@ -323,18 +377,18 @@ examples:
         arches   = manifest.get("arches", {})
 
         if not version or not arches.get(arch):
-            print(f"  SKIP {slug:<40} not available for {arch}")
+            print(f"  SKIP {slug:<44} not available for {arch}")
             skipped += 1
             continue
 
         installed = get_installed_version(plugin_dir, slug)
         if installed == version:
-            print(f"  OK   {slug:<40} {version}")
+            print(f"  OK   {slug:<44} {version}")
             skipped += 1
             continue
 
-        label = (f"UPD  {slug:<40} {installed} -> {version}"
-                 if installed else f"GET  {slug:<40} {version}")
+        label = (f"UPD  {slug:<44} {installed} -> {version}"
+                 if installed else f"GET  {slug:<44} {version}")
 
         if args.check:
             print(f"  {label}  [dry run]")
@@ -359,7 +413,7 @@ examples:
     print()
     print(f"Downloaded: {downloaded}  Skipped: {skipped}  Failed: {failed}  Need subscribe: {len(to_subscribe)}")
 
-    # -- Subscribe list -------------------------------------------------------
+    # -- Subscribe list --------------------------------------------------------
     if to_subscribe:
         print()
         print("Subscribe these plugins for free at library.vcvrack.com:")
@@ -378,7 +432,7 @@ examples:
     if downloaded > 0:
         print("\nRestart VCV Rack to load new plugins.")
 
-    # -- Favorites ------------------------------------------------------------
+    # -- Favorites -------------------------------------------------------------
     if args.favorites:
         print("\nUpdating VCV Rack favorites with MetaModule modules...")
         update_favorites(plugin_dir, paths["favorites"])
